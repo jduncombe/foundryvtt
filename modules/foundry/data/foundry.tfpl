@@ -1,0 +1,148 @@
+#! /usr/bin/env bash
+
+#create foundry user
+useradd -m foundry
+
+#Setup node
+dnf install -y openssl-devel
+curl --silent --location https://rpm.nodesource.com/setup_16.x | sudo bash -
+dnf install -y nodejs
+
+#download and unpack foundry
+aws s3 cp s3://${bucket_name}/FoundryVTT-11.299.zip /tmp/foundry.zip --region ap-southeast-4
+mkdir -p /opt/foundry
+mkdir -p /opt/foundrydata/Config/
+unzip /tmp/foundry.zip -d /opt/foundry
+cat > /lib/systemd/system/foundry.service << EOF
+[Unit]
+Description=A service to run the Foundry VTT node app
+Documentation=https://foundryvtt.com
+After=network.target
+
+[Service]
+Environment=NODE_PORT=30000
+Type=simple
+User=foundry
+ExecStart=/usr/bin/node /opt/foundry/resources/app/main.js --dataPath=/opt/foundrydata
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable foundry
+cat > /opt/foundrydata/Config/options.json << EOF
+{
+"hostname": "${domain_name}",
+"routePrefix": null,
+"sslCert": null,
+"sslKey": null,
+"port": 30000,
+"proxyPort": 443,
+"proxySSL": true
+}
+EOF
+chown -hR foundry: /opt/foundry*
+
+# install nginx
+dnf install -y nginx
+systemctl enable nginx
+
+cat > "etc/nginx/nginx.conf" << EOF
+# This goes in a file within /etc/nginx/sites-available/. By convention,
+# the filename would be either "your.domain.com" or "foundryvtt", but it
+# really does not matter as long as it's unique and descriptive for you.
+# For more information on configuration, see:
+#   * Official English Documentation: http://nginx.org/en/docs/
+#   * Official Russian Documentation: http://nginx.org/ru/docs/
+
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log notice;
+pid /run/nginx.pid;
+
+# Load dynamic modules. See /usr/share/doc/nginx/README.dynamic.
+include /usr/share/nginx/modules/*.conf;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log  /var/log/nginx/access.log  main;
+
+    sendfile            on;
+    tcp_nopush          on;
+    keepalive_timeout   65;
+    types_hash_max_size 4096;
+
+    include             /etc/nginx/mime.types;
+    default_type        application/octet-stream;
+
+    # Load modular configuration files from the /etc/nginx/conf.d directory.
+    # See http://nginx.org/en/docs/ngx_core_module.html#include
+    # for more information.
+    include /etc/nginx/conf.d/*.conf;
+           
+    # Define Server
+    server {
+            
+        # Enter your fully qualified domain name or leave blank
+        server_name             ${domain_name};
+            
+        # Listen on port 443 using SSL certificates
+        listen                  443 ssl;
+        ssl_certificate         "/etc/letsencrypt/live/${domain_name}/fullchain.pem";
+        ssl_certificate_key     "/etc/letsencrypt/live/${domain_name}/privkey.pem";
+            
+        # Sets the Max Upload size to 300 MB
+        client_max_body_size 300M;
+            
+        # Proxy Requests to Foundry VTT
+        location / {
+            
+            # Set proxy headers
+            proxy_set_header Host \$host;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            
+            # These are important to support WebSockets
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection "Upgrade";
+            
+            # Make sure to set your Foundry VTT port number
+            proxy_pass http://localhost:30000;
+        }
+    }
+
+    # Optional, but recommend. Redirects all HTTP requests to HTTPS for you
+    server {
+        if (\$host = ${domain_name}) {
+            return 301 https://\$host\$request_uri;
+        }
+
+        listen 80;
+        listen [::]:80;
+
+        server_name ${domain_name};
+        return 404;
+    }
+}
+EOF
+
+
+#install certbot
+dnf install -y python3 augeas-libs
+python3 -m venv /opt/certbot/
+/opt/certbot/bin/pip install --upgrade pip
+/opt/certbot/bin/pip install certbot certbot-dns-route53
+ln -s /opt/certbot/bin/certbot /usr/bin/certbot
+#generate SSL certificate
+certbot certonly --dns-route53 -d ${domain_name} --email jamie@jduncombe.com --agree-tos --no-eff-email -n
+echo "0 0,12 * * * root /opt/certbot/bin/python -c 'import random; import time; time.sleep(random.random() * 3600)' && sudo certbot certonly --dns-route53 -d ${domain_name} --email jamie@jduncombe.com -n" | sudo tee -a /etc/crontab > /dev/null
+
+systemctl start nginx
+systemctl start foundry
